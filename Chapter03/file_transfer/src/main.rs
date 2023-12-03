@@ -7,19 +7,18 @@
 
 use actix_web::Error;
 use actix_web::{web, web::Path, App, HttpRequest, HttpResponse, HttpServer, Responder};
-use futures::{
-    future::{ok, Future},
-    Stream,
-};
+use futures::{TryFutureExt, TryStreamExt};
 use rand::prelude::*;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
+use tokio::fs::File as TokioFile;
+use tokio::io::AsyncWriteExt;
 
 fn flush_stdout() {
     std::io::stdout().flush().unwrap();
 }
 
-fn delete_file(info: Path<(String,)>) -> impl Responder {
+async fn delete_file(info: Path<(String,)>) -> impl Responder {
     let filename = &info.0;
     print!("Deleting file \"{}\" ... ", filename);
     flush_stdout();
@@ -37,7 +36,7 @@ fn delete_file(info: Path<(String,)>) -> impl Responder {
     }
 }
 
-fn download_file(info: Path<(String,)>) -> impl Responder {
+async fn download_file(info: Path<(String,)>) -> impl Responder {
     let filename = &info.0;
     print!("Downloading file \"{}\" ... ", filename);
     flush_stdout();
@@ -61,10 +60,10 @@ fn download_file(info: Path<(String,)>) -> impl Responder {
     }
 }
 
-fn upload_specified_file(
+async fn upload_specified_file(
     payload: web::Payload,
-    info: Path<(String,)>,
-) -> impl Future<Item = HttpResponse, Error = Error> {
+    info: web::Path<(String,)>,
+) -> impl Responder {
     let filename = info.0.clone();
 
     print!("Uploading file \"{}\" ... ", filename);
@@ -74,44 +73,44 @@ fn upload_specified_file(
     // the contents to write into the file.
     payload
         .map_err(Error::from)
-        .fold(web::BytesMut::new(), move |mut body, chunk| {
+        .try_fold(web::BytesMut::new(), |mut body, chunk| async move {
             body.extend_from_slice(&chunk);
             Ok::<_, Error>(body)
         })
-        .and_then(move |contents| {
+        .map_ok(|contents| (filename, contents))
+        .and_then(|(filename, contents)| async move {
             // Create the file.
-            let f = File::create(&filename);
-            if f.is_err() {
+            let f = TokioFile::create(&filename).await;
+            if let Err(_) = f {
                 println!("Failed to create file \"{}\"", filename);
-                return ok(HttpResponse::NotFound().into());
+                return Ok(HttpResponse::NotFound().finish());
             }
 
             // Write the contents into it.
-            if f.unwrap().write_all(&contents).is_err() {
+            if let Err(_) = f.unwrap().write_all(&contents).await {
                 println!("Failed to write file \"{}\"", filename);
-                return ok(HttpResponse::NotFound().into());
+                return Ok(HttpResponse::NotFound().finish());
             }
 
             println!("Uploaded file \"{}\"", filename);
-            ok(HttpResponse::Ok().finish())
+            Ok(HttpResponse::Ok().finish())
         })
+        .await
 }
 
-fn upload_new_file(
-    payload: web::Payload,
-    info: Path<(String,)>,
-) -> impl Future<Item = HttpResponse, Error = Error> {
+async fn upload_new_file(payload: web::Payload, info: web::Path<(String,)>) -> impl Responder {
     let filename_prefix = info.0.clone();
     print!("Uploading file \"{}*.txt\" ... ", filename_prefix);
     flush_stdout();
 
     payload
         .map_err(Error::from)
-        .fold(web::BytesMut::new(), move |mut body, chunk| {
+        .try_fold(web::BytesMut::new(), |mut body, chunk| async move {
             body.extend_from_slice(&chunk);
             Ok::<_, Error>(body)
         })
-        .and_then(move |contents| {
+        .map_ok(move |contents| (filename_prefix, contents))
+        .and_then(|(filename_prefix, contents)| async move {
             let mut rng = rand::thread_rng();
             let mut attempts = 0;
             let mut file;
@@ -126,7 +125,7 @@ fn upload_new_file(
                          after {} attempts.",
                         filename_prefix, MAX_ATTEMPTS
                     );
-                    return ok(HttpResponse::NotFound().into());
+                    return Ok(HttpResponse::NotFound().finish());
                 }
 
                 // Generate a 3-digit pseudo-random number.
@@ -134,10 +133,7 @@ fn upload_new_file(
                 filename = format!("{}{:03}.txt", filename_prefix, rng.gen_range(0, 1000));
 
                 // Create a not-yet-existing file.
-                file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&filename);
+                file = TokioFile::create(&filename).await;
 
                 // If it was created, exit the loop.
                 if file.is_ok() {
@@ -145,23 +141,25 @@ fn upload_new_file(
                 }
             }
 
-            // Write the contents into it synchronously.
-            if file.unwrap().write_all(&contents).is_err() {
+            // Write the contents into it asynchronously.
+            if file.unwrap().write_all(&contents).await.is_err() {
                 println!("Failed to write file \"{}\"", filename);
-                return ok(HttpResponse::NotFound().into());
+                return Ok(HttpResponse::NotFound().finish());
             }
 
             println!("Uploaded file \"{}\"", filename);
-            ok(HttpResponse::Ok().content_type("text/plain").body(filename))
+            Ok(HttpResponse::Ok().content_type("text/plain").body(filename))
         })
+        .await
 }
 
-fn invalid_resource(req: HttpRequest) -> impl Responder {
+async fn invalid_resource(req: HttpRequest) -> impl Responder {
     println!("Invalid URI: \"{}\"", req.uri());
     HttpResponse::NotFound()
 }
 
-fn main() -> std::io::Result<()> {
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
     let server_address = "127.0.0.1:8080";
     println!("Listening at address {} ...", server_address);
     HttpServer::new(|| {
@@ -170,11 +168,13 @@ fn main() -> std::io::Result<()> {
                 web::resource("/{filename}")
                     .route(web::delete().to(delete_file))
                     .route(web::get().to(download_file))
-                    .route(web::put().to_async(upload_specified_file))
-                    .route(web::post().to_async(upload_new_file)),
+                    .route(web::put().to(upload_specified_file))
+                    .route(web::post().to(upload_new_file)),
             )
             .default_service(web::route().to(invalid_resource))
     })
     .bind(server_address)?
     .run()
+    .await
 }
+
