@@ -16,75 +16,98 @@
 // Uploading file "data_*.txt" ... Uploaded file "data_17.txt"
 // Invalid URI: "/a/b"
 
-use actix_web::{web, web::Path, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use futures_util::StreamExt;
 use std::io::Write;
 
 fn flush_stdout() {
     std::io::stdout().flush().unwrap();
 }
 
-fn delete_file(info: Path<(String,)>) -> impl Responder {
-    let filename = &info.0;
-    print!("Deleting file \"{}\" ... ", filename);
+async fn delete_file(info: web::Path<String>) -> impl Responder {
+    let filename = &info;
+    println!("Deleting file \"{}\" ... ", filename);
     flush_stdout();
 
-    // TODO: Delete the file.
-
-    println!("Deleted file \"{}\"", filename);
-    HttpResponse::Ok()
+    let file = std::fs::remove_file(filename.to_string());
+    match file {
+        Ok(_ok) => {
+            println!("Deleted file \"{}\"", filename);
+            return HttpResponse::Ok();
+        }
+        Err(err) => {
+            println!("Error while deleting file \"{}\": {}", filename, err);
+            return HttpResponse::NotFound();
+        }
+    }
 }
 
-fn download_file(info: Path<(String,)>) -> impl Responder {
-    let filename = &info.0;
-    print!("Downloading file \"{}\" ... ", filename);
+async fn download_file(info: web::Path<String>) -> impl Responder {
+    let filename = &info;
+    println!("Downloading file \"{}\" ... ", filename);
     flush_stdout();
 
-    // TODO: Read the contents of the file.
-    let contents = "Contents of the file.\n".to_string();
+    let contents = std::fs::read_to_string(filename.to_string());
 
-    println!("Downloaded file \"{}\"", filename);
-    HttpResponse::Ok().content_type("text/plain").body(contents)
+    match contents {
+        Ok(data) => {
+            println!("Downloaded file \"{}\"", filename);
+            return HttpResponse::Ok().content_type("text/plain").body(data);
+        }
+        Err(err) => {
+            println!("Error downloading the file: {}", err);
+            return HttpResponse::NotFound().into();
+        }
+    }
 }
 
-fn upload_specified_file(info: Path<(String,)>) -> impl Responder {
-    let filename = &info.0;
+async fn upload_specified_file(
+    info: web::Path<String>,
+    mut payload: web::Payload,
+) -> impl Responder {
+    let filename = &info;
     print!("Uploading file \"{}\" ... ", filename);
     flush_stdout();
 
-    // TODO: Get from the client the contents to write into the file.
-    let _contents = "Contents of the file.\n".to_string();
+    // Read the request payload (file contents)
+    let mut contents = web::BytesMut::new();
+    while let Some(chunk) = payload.next().await {
+        contents.extend_from_slice(&chunk.unwrap());
+    }
 
-    // TODO: Create the file and write the contents into it.
+    let contents_str = String::from_utf8_lossy(&contents);
+    std::fs::write(filename.to_string(), &*contents_str).unwrap();
 
     println!("Uploaded file \"{}\"", filename);
     HttpResponse::Ok()
 }
 
-fn upload_new_file(info: Path<(String,)>) -> impl Responder {
-    let filename = &info.0;
+async fn upload_new_file(info: web::Path<String>, mut payload: web::Payload) -> impl Responder {
+    let filename = &info;
     print!("Uploading file \"{}*.txt\" ... ", filename);
     flush_stdout();
 
-    // TODO: Get from the client the contents to write into the file.
-    let _contents = "Contents of the file.\n".to_string();
+    let mut contents = web::BytesMut::new();
+    while let Some(chunk) = payload.next().await {
+        contents.extend_from_slice(&chunk.unwrap());
+    }
 
-    // TODO: Generate new filename and create that file.
+    let contents_str = String::from_utf8_lossy(&contents);
     let file_id = 17;
-
     let filename = format!("{}{}.txt", filename, file_id);
-
-    // TODO: Write the contents into the file.
+    std::fs::write(filename.to_string(), &*contents_str).unwrap();
 
     println!("Uploaded file \"{}\"", filename);
     HttpResponse::Ok().content_type("text/plain").body(filename)
 }
 
-fn invalid_resource(req: HttpRequest) -> impl Responder {
+async fn invalid_resource(req: HttpRequest) -> impl Responder {
     println!("Invalid URI: \"{}\"", req.uri());
     HttpResponse::NotFound()
 }
 
-fn main() -> std::io::Result<()> {
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
     let server_address = "127.0.0.1:8080";
     println!("Listening at address {} ...", server_address);
     HttpServer::new(|| {
@@ -100,4 +123,6 @@ fn main() -> std::io::Result<()> {
     })
     .bind(server_address)?
     .run()
+    .await
 }
+
